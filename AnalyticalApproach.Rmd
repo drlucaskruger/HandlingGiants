@@ -1,0 +1,216 @@
+---
+title: "Analysis for the paper 'Handling giants: short-term behavioral responses of Southern Giant Petrels to data sampling during breeding season and its effects over breeding success'"
+author: "Lucas Krüger"
+date: "2024-01-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load necessary packages
+
+
+```{r, echo=F}
+
+library(ggplot2)
+library(plyr)
+library(car)
+library(pscl)
+library(sjPlot)
+library(patchwork)
+library(lubridate)
+library(lmerTest)
+
+# Need to install from R-Forge instead of CRAN
+#install.packages("topmodels", repos = "https://R-Forge.R-project.org")
+#install.packages("countreg", repos="http://R-Forge.R-project.org")
+
+library(countreg)
+library(topmodels)
+library(pscl)
+
+
+
+```
+
+## Firstly, load and process the data on handling time of each animal
+
+
+```{r pressure, echo=FALSE}
+
+df<-read.csv("data.csv") # data frame of handling for each individual animal 
+
+head(df) 
+
+
+# summarize to have the number of animals sampled
+sumtab<-ddply(df,c("Ring"),summarise,
+              N=length(Sex))
+
+uif<-data.frame(unique(sumtab$Ring)) # number of animals
+
+summary(as.factor(sumtab$N)) # number of times animals were sampled most animals were captured only once in 3 seasons, therefore mixed models might not be the best approach in this case
+
+# handling time description
+
+summary(df$Handle)
+
+summary(df$Handle) 
+sd(df$Handle) 
+ggplot(df,aes(Handle))+geom_histogram()+
+  geom_vline(xintercept = 13,linetype="dashed",colour="red",size=1)+
+  geom_vline(xintercept = 10,linetype="dotted",colour="red",size=1)+
+  geom_vline(xintercept = 17,linetype="dotted",colour="red",size=1)+
+  theme_bw()+xlab("Handling time (minutes)")+coord_flip()
+
+
+
+df$timeStamp<-as.POSIXct(strptime(df$DateSTD, format="%d/%m/%Y", tz="GMT"))
+
+df$absec<-as.integer(df$AbsenceMin*60) # absec is absence form the nest after release, aka time to return to the nest, in seconds
+
+summary(df$absec)
+
+df$LeaveNest<-ifelse(df$absec>0,1,0) # binary transformation. If the animal remained in the nest after release, the value is zero, if left the nest, is 1
+
+summary(as.factor(df$LeftNest))
+
+length(df$Colony[df$LeftNest=="Y"])/length(df$Colony) # 39.5% of animals left nest after release
+
+mean(na.omit(df$absec[df$LeftNest=="Y"]))
+sd(na.omit(df$absec[df$LeftNest=="Y"]))
+
+# 230 ± 583 secs to return to nest. Definitely not normal
+
+median(na.omit(df$absec[df$LeftNest=="Y"]))  # 56 seconds
+quantile(na.omit(df$absec[df$LeftNest=="Y"])) # 25% quantiles; lower = 10 secs;upper = 226.5 secs
+
+
+
+```
+
+#SInce there are two components that we were interested in testing (probability of leaving the nest and count of seconds to return if ever leaving the nest) and most animals were not sampled more than once, a Hurdle Model is a good analytical choice.
+
+
+```{r, echo=T}
+
+ggplot(df,aes(absec))+geom_histogram()
+ggplot(subset(df,absec<1200),aes(absec))+geom_histogram()
+
+boxplot(df$absec)
+
+ggplot((df),aes(Handle))+geom_histogram()
+
+boxplot(df$Handle) # one single handling time outlier. Lets keep it for now
+
+
+ggplot(subset(df,absec>0),aes(Handle,absec))+
+  geom_smooth(method="lm")+theme_bw()+
+  geom_point()+xlab("Handling time")+ylab("Seconds to return to nest")+
+  scale_y_log10()   # this gives a hint of what to expect from the results
+
+
+df2<-na.omit(df)
+
+
+#lets test two distributions of the non-zero part of the data
+
+mh1<-hurdle(absec ~ Handle*Sex  ,dist="negbin",zero.dist = "binomial",data=df2,link="logit")
+mh2<-hurdle(absec ~ Handle*Sex  ,dist="geometric",zero.dist = "binomial",data=df2,link="logit")
+
+
+qqrplot(mh1)
+qqrplot(mh2)
+
+wormplot(mh1)
+wormplot(mh2)
+
+# both are ok, but mh1 (negative binomial) looks slightly better, and is the recommended to our type of data anyways, based on dispersion θ  (Zeileis et al. 2008)
+
+summary(mh1)  #the log theta component was significant
+
+
+plot_model(mh1,type="int",ci.lvl = 0.01,show.data = T,se=NULL,jitter = 0.5)+theme_bw()+
+  xlab("Handling time (minutes)")+ylab("Time to return to nest (seconds)")+
+  ggtitle(label="Negative binomial fit")
+
+plot_model(mh2,type="int",ci.lvl = 0.01,show.data = T,se=NULL,jitter = 0.5)+theme_bw()+
+  xlab("Handling time (minutes)")+ylab("Time to return to nest (seconds)")+
+  ggtitle(label="Time to return to nest after release")
+
+
+
+```
+
+
+# The next step is use the colony data to test for effects on overall breeding success
+# each colony had its nests monitored at start and end (therefore we recorded which nests failed)
+
+```{r, echo=F}
+
+nc<-read.csv("success182022.csv")
+head(nc)
+
+nc$DistNum<-ifelse(nc$ColonyType=="Disturbed",1,0) # this represents if visits to the colony were to capture animals
+
+nc$ColonyNumber<-as.factor(nc$ColonyNumber)
+
+ncM<-ddply(nc, c("ColonyName"), summarise,
+           Disturbance=mean(DistNum))
+
+ncM2<-data.frame(grp=ncM$ColonyName, Disturbance=ncM$Disturbance)
+
+
+ncM<-ddply(nc, c("ColonyNumber","ColonyName"), summarise,
+           Disturbance=mean(DistNum))
+ncM
+
+#classify colonies based on the frequency of periods visiting the colony to capture animals
+
+ncM$Dist[ncM$Disturbance>0.9]<-"Disturbed"
+
+ncM$Dist[ncM$Disturbance<=0.9 & ncM$Disturbance>0.1]<-"Partially"
+
+ncM$Dist[ncM$Disturbance=="0"]<-"Full Control"
+
+summary(as.factor(ncM$Dist))
+
+ncc<-merge(nc,ncM,by="ColonyNumber")
+
+head(ncc)
+
+glmNC<-glmer(Success~Dist+(1|ColonyNumber),data=ncc,family="binomial")
+
+glmNC0<-glm(Success~Dist,data=ncc,family="binomial")
+
+summary(glmNC)
+
+anova(glmNC)
+
+anova(glmNC,glmNC0)
+
+###-------random effect- colony varibility was significant-----------
+
+randC<-as.data.frame(glmmTMB::ranef(glmNC,condVar=T))
+
+ncM2<-data.frame(grp=ncM$ColonyNumber,Dist=ncM$Dist,Disturbance=ncM$Disturbance)
+
+randC2<-merge(randC,ncM2,by="grp")
+
+
+sj1<-plot_model(glmNC,type="emm",terms="Dist[Disturbed,Partially,Full Control]")+
+  theme_bw()+ggtitle("a. Predicted probability of success")
+  
+ sj2<- plot_model(glmNC,type="re")+
+  theme_bw()+
+  ylab("Intercept")+xlab("Colony")+
+  ggtitle("b. Random intercept")
+
+ sj1/sj2   # ps colours on this plot were changed manually outside R
+
+
+
+```
+
